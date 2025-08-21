@@ -1,0 +1,5 @@
+{
+  "name": "lamumu-run-api",
+  "private": true,
+  "dependencies": { "ioredis": "5.4.1" }
+}

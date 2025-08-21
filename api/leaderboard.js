@@ -1,60 +1,70 @@
-export const config = { runtime: "edge" };
+// Node.js Serverless Function (ioredis)
+module.exports.config = { runtime: 'nodejs' };
 
-// --- Upstash REST config ---
-const BASE = process.env.UPSTASH_REDIS_REST_URL;
-const TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-const NS = process.env.LAMUMU_NS || "lamumu:run";
-const RANK_KEY = `${NS}:rank`;
+const Redis = require('ioredis');
 
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
-}
-async function call(...parts) {
-  if (!BASE || !TOKEN) throw new Error("Missing Upstash env vars");
-  const u = [BASE, ...parts.map(encodeURIComponent)].join("/");
-  const r = await fetch(u, { headers: { Authorization: `Bearer ${TOKEN}` } });
-  const data = await r.json();
-  if (!r.ok || data?.error) throw new Error(data?.error || r.statusText);
-  return data.result;
+let client;
+function getRedis() {
+  if (client) return client;
+  const url = process.env.REDIS_URL;
+  if (!url) throw new Error('REDIS_URL is not set');
+  let opts = {};
+  try {
+    const u = new URL(url);
+    if (u.protocol === 'rediss:') opts.tls = {};
+  } catch (_) {}
+  client = new Redis(url, opts);
+  return client;
 }
 
-export default async function handler(req) {
-  if (req.method !== "GET") return json({ error: "Method not allowed" }, 405);
+const NS = process.env.LAMUMU_NS || 'lamu';
+const BOARD_KEY = `${NS}:board`;          // ZSET (rank)
+const DETAIL_KEY = (h) => `${NS}:detail:${h}`; // HASH (score, timeMs, updatedAt)
 
-  const { searchParams } = new URL(req.url);
-  const start   = Math.max(0, Number(searchParams.get("start") ?? 0) | 0);
-  const count   = Math.min(200, Math.max(1, Number(searchParams.get("count") ?? 50) | 0));
-  const rankFor = (searchParams.get("rankFor") || "").trim().toLowerCase();
-  const stop = start + count - 1;
+module.exports = async (req, res) => {
+  if (req.method !== 'GET') { res.statusCode = 405; res.end('Method Not Allowed'); return; }
 
-  // Toplam kayıt
-  const total = Number(await call("ZCARD", RANK_KEY)) || 0;
+  try {
+    const r = getRedis();
 
-  // Üyeler (büyükten küçüğe)
-  const members = await call("ZREVRANGE", RANK_KEY, String(start), String(stop)); // ["h1","h2",...]
-  let items = [];
+    // ?start=0&count=50&rankFor=handle
+    const url = new URL(req.url, 'http://localhost');
+    const start = Math.max(0, parseInt(url.searchParams.get('start') ?? '0', 10));
+    const count = Math.max(1, Math.min(200, parseInt(url.searchParams.get('count') ?? '50', 10)));
+    const rankForRaw = url.searchParams.get('rankFor');
+    const rankFor = rankForRaw ? String(rankForRaw).toLowerCase().replace(/^@/, '').trim() : null;
 
-  if (Array.isArray(members) && members.length) {
-    // HMGET'leri paralel çalıştır
-    const rows = await Promise.all(
-      members.map((m) => call("HMGET", `${NS}:user:${m}`, "score", "timeMs").catch(() => [0,0]))
-    );
-    items = rows.map((row, i) => ({
-      handle: members[i],
-      score: Number(row?.[0] ?? 0),
-      timeMs: Number(row?.[1] ?? 0),
-    }));
+    const totalPromise = r.zcard(BOARD_KEY);
+    const handles = await r.zrevrange(BOARD_KEY, start, start + count - 1);
+    const total = await totalPromise;
+
+    let rank = null;
+    if (rankFor) {
+      const rv = await r.zrevrank(BOARD_KEY, rankFor);
+      if (rv !== null && rv !== undefined) rank = rv + 1; // 1-based
+    }
+
+    let items = [];
+    if (handles.length) {
+      const pipe = r.pipeline();
+      for (const h of handles) pipe.hmget(DETAIL_KEY(h), 'score', 'timeMs', 'updatedAt');
+      const rows = await pipe.exec();
+      items = handles.map((h, i) => {
+        const arr = rows[i]?.[1] || [];
+        return {
+          handle: h,
+          score: parseInt(arr?.[0] ?? '0', 10),
+          timeMs: parseInt(arr?.[1] ?? '0', 10),
+          updatedAt: parseInt(arr?.[2] ?? '0', 10),
+        };
+      });
+    }
+
+    res.statusCode = 200;
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ items, start, count, total, rank }));
+  } catch (e) {
+    res.statusCode = 500; res.setHeader('content-type','application/json');
+    res.end(JSON.stringify({ error: String(e) }));
   }
-
-  // İsteğe bağlı: tek kullanıcının sırası
-  let rank = null;
-  if (rankFor) {
-    const r = await call("ZREVRANK", RANK_KEY, rankFor).catch(() => null);
-    rank = (r == null) ? null : Number(r) + 1; // 1-based
-  }
-
-  return json({ items, total, rank });
-}
+};
